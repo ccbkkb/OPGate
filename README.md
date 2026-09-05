@@ -1,4 +1,14 @@
+<div align="center">
+
 # OPGate — OpenCode Session Gateway
+
+[![CI](https://github.com/ccbkkb/OPGate/actions/workflows/ci.yml/badge.svg)](https://github.com/ccbkkb/OPGate/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/ccbkkb/OPGate?include_prereleases)](https://github.com/ccbkkb/OPGate/releases)
+[![Docker](https://img.shields.io/badge/docker-ghcr.io%2Fccbkkb%2Fopgate-2496ED)](https://github.com/ccbkkb/OPGate/pkgs/container/opgate)
+[![Go](https://img.shields.io/badge/Go-1.24%2B-00ADD8?logo=go&logoColor=white)](https://go.dev)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+</div>
 
 轻量、高性能的 Go HTTP 反向代理，部署在 OpenCode API（OpenAI-compatible）前面。
 为 **RikkaHub / Python httpx / requests** 等无法发送 `x-opencode-session` 的第三方客户端
@@ -32,16 +42,46 @@ Session S1 ──► X-Opencode-Session: S1 ──► OpenCode API
               Hash(full conversation state) → S1 写入 Redis
 ```
 
+## 客户端接入
+
+**路径拼接规则**：出站路径 = `upstream.base_url` 的路径前缀 + 客户端请求路径。
+因此若 `base_url` 已含版本前缀（如 `https://opencode.ai/zen/v1`），客户端就**不要**再带 `/v1`：
+
+```
+base_url: "https://opencode.ai/zen/v1"
+客户端:  POST http://<网关>:7123/chat/completions
+上游:    POST https://opencode.ai/zen/v1/chat/completions   ✓
+```
+
+任何以 `/chat/completions` 结尾的 POST 请求都会进入会话逻辑，其余路径全部透明透传
+（`/v1/models` 等照常可用）。
+
+**curl 示例**（客户端完全不感知 `x-opencode-session`）：
+
+```bash
+# 非流式
+curl http://127.0.0.1:7123/chat/completions \
+  -H "Authorization: Bearer $OPENCODE_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"mimo-v2.5-free","messages":[{"role":"user","content":"hi"}]}'
+
+# 流式（SSE 实时输出）
+curl -N http://127.0.0.1:7123/chat/completions \
+  -H "Authorization: Bearer $OPENCODE_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"mimo-v2.5-free","stream":true,"messages":[{"role":"user","content":"hi"}]}'
+```
+
+客户端每次携带完整 conversation history（标准 OpenAI 行为）即可，
+网关通过 `Hash(messages[:-1])` 自动把连续多轮绑定到同一个 session；客户端**主动提供**
+`x-opencode-session` 时会被原样尊重、不覆盖。
+
 ## 快速开始
 
 ```bash
 go build -o ocgate ./cmd/ocgate
 cp config.example.yml config.yml   # 修改 upstream.base_url 后启动
 ./ocgate -config config.yml
+./ocgate -version
 ```
-
-客户端只需把 base URL 指向网关（例如 `http://127.0.0.1:8080/v1`），
-不需要任何 `x-opencode-session` 适配。
 
 ## 配置
 
@@ -58,9 +98,9 @@ session:
   ttl: 168h            # stateHash → sessionID 映射 TTL，默认 7 天
 response_cache:
   page_size: 4MiB      # RAM 页大小（1MiB–8MiB 建议）
-  ttl: 30m             # 临时分页 TTL（须明显小于 session.ttl）
-  workers: 4           # 页写入 worker 数（固定）
-  max_pending_pages: 8 # 有界队列深度，防止 Redis 慢时 RAM 无限增长
+  ttl: 30m
+  workers: 4
+  max_pending_pages: 8
 limits:
   max_request_body: 32MiB
 logging:
@@ -137,7 +177,7 @@ go test ./... -count=1
 ```
 
 - Test 1–6：首条请求 / 命中 / 多轮 / branching / 相同首条消息 / 相同完整历史
-- Test 7/9：长流分页 + RAM tail 拼接（20MB 响应 ≈ 19.5MB/4MiB 页）
+- Test 7/9：长流分页 + RAM tail 拼接（20MB 响应 ≈ 5 页）
 - Test 8：最后一页 in-flight 竞态（Finalize 等待，不丢数据）
 - Test 10：Redis 页写失败 → SSE 照常、Finalize 失败、不建映射
 - Test 11：上游断流 → Abort、不建映射
@@ -146,34 +186,38 @@ go test ./... -count=1
 - Test 14：`stream=false` → 无分页、直接建映射
 - 并发（§46）：4 个 conversation 并行互不干扰
 - 实时性（§15）：客户端在 upstream 结束前就开始收到数据
+- **脱敏（§43/§54）**：金丝雀凭证/内容断言不出现在日志与 Redis，凭证仍正常透传上游
 
-注：Finalize 阶段会一次性拼装完整原始 SSE 流用于解析 assistant message
-（§24 的设计取舍），网关的稳态 RAM 由 `page_size + max_pending_pages` 决定，
-与响应总大小无关。
+## 日志与隐私
 
-## 日志与安全
+| 信息 | 日志中 | 说明 |
+|---|---|---|
+| API Key / Authorization | ❌ 永不 | 仅记录 `client_hash` = SHA-256(凭证) 前 12 位 |
+| 请求体 / prompt | ❌ 永不 | 仅记录 `messages=N` 条数；内容仅在内存中参与哈希 |
+| 助手回复内容 | ❌ 永不 | finalize 只记录 pages / bytes / hash |
+| request_id / session_id | ✅ | 排障关联 ID |
+| state_hash / client_hash | ✅ 前 12 位 | 单向哈希，泄露无法反推内容或凭证 |
 
-- 结构化日志含 `request_id / session_id / state_hash / client_hash`（均短前缀）
-- 不记录 Authorization / API Key / 消息内容
-- 请求体大小受限（413）；内部 requestID 不暴露给上游；临时数据强制 TTL
+以上由 `TestLogsAndRedisAreSanitized`（金丝雀值断言）在 CI 中持续守护；
+`logging.level: debug` 也**不会**输出消息内容。
 
 ## 部署
 
 ### Docker（GHCR 多架构镜像）
 
-镜像：`ghcr.io/ccbkkb/opgate`，支持 `linux/amd64`、`linux/arm64`、`linux/arm/v7`，
-兼容 Debian/Ubuntu/Fedora/Arch 与 Alpine（静态二进制，无 libc 依赖）。
+镜像：`ghcr.io/ccbkkb/opgate`，支持 `linux/amd64`、`linux/arm64`、`linux/arm/v7`
+（静态二进制，Debian/Ubuntu/Fedora/Arch 与 Alpine 通用）。
 
 ```bash
-# 固定版本
-docker pull ghcr.io/ccbkkb/opgate:v0.1.0
-# 或 latest
 docker pull ghcr.io/ccbkkb/opgate:latest
 
-docker run -d --name ocgate -p 8080:8080 \
+docker run -d --name ocgate -p 127.0.0.1:7123:8080 \
   -v $PWD/config.yml:/etc/ocgate/config.yml:ro \
   ghcr.io/ccbkkb/opgate:latest
 ```
+
+> 标签说明：自 v0.1.1 起同时发布 `vX.Y.Z` 与 `X.Y.Z` 两种标签；
+> v0.1.0 的镜像仅有 `0.1.0` / `0.1` / `0` / `latest`。
 
 或使用 docker compose（自带 Redis）：
 
@@ -200,17 +244,7 @@ docker compose up -d
 只输出一条 WARN 日志，但会静默降级：每轮对话都生成新 session、长响应不再落盘。
 生产环境务必确认启动日志里没有 `redis is not reachable`。
 
-独立 `docker run` 接外部 Redis 的示例：
-
-```bash
-docker network create ocgate
-docker run -d --name ocgate-redis --network ocgate redis:7-alpine
-docker run -d --name ocgate --network ocgate -p 8080:8080 \
-  -v $PWD/config.yml:/etc/ocgate/config.yml:ro \      # redis.addr 指向 ocgate-redis:6379
-  ghcr.io/ccbkkb/opgate:latest
-```
-
-> 按设计（DEVELOP.md §42），Redis 故障只影响会话复用，不影响代理与 SSE 可用性；
+> 按设计（§42），Redis 故障只影响会话复用，不影响代理与 SSE 可用性；
 > 多副本扩容时，多个网关实例可共享同一个 Redis。
 
 ### 二进制下载
@@ -236,6 +270,17 @@ Termux 用户：
 tar -xzf ocgate_<ver>_android-arm64.tar.gz && chmod +x ocgate && ./ocgate -config config.yml
 ```
 
+## 生产验证
+
+在公网 VPS（Docker 部署，网关仅绑定 `127.0.0.1:7123`）对 `opencode.ai/zen`
+（`mimo-v2.5-free`）实测：
+
+- 3 轮对话：`new → resolved → resolved`，全程同一 session；
+- SSE 流式分片实时到达，`[DONE]` 正常；
+- 客户端自带 session 透传不被覆盖；
+- Redis 映射正确落库、临时页零残留；
+- 日志经金丝雀 grep 验证不含 key 与请求内容。
+
 ## 发布流程（自动化）
 
 推送 `v*` 标签即自动完成（`.github/workflows/release.yml`）：
@@ -244,12 +289,12 @@ tar -xzf ocgate_<ver>_android-arm64.tar.gz && chmod +x ocgate && ./ocgate -confi
    windows amd64/arm64、android arm64），`CGO_ENABLED=0` 静态链接，
    版本号通过 `-ldflags "-X main.version=..."` 注入；
 2. **构建多架构 Docker 镜像** 并推送到 `ghcr.io/ccbkkb/opgate`
-   （`vX.Y.Z`、`vX.Y`、`vX`、`latest` 多标签）；
+   （`vX.Y.Z`、`X.Y.Z`、`X.Y`、`X`、`latest` 多标签）；
 3. **创建 GitHub Release**：自动生成完整的 release 说明正文（下载表、Docker 用法、
    SHA256 校验、快速开始、自上个 tag 以来的完整变更列表），并上传全部产物与 `SHA256SUMS.txt`。
 
 ```bash
-git tag v0.1.0 && git push origin main --follow-tags
+git tag v0.2.0 && git push origin v0.2.0
 ```
 
 普通 push/PR 由 `ci.yml` 执行 build + vet + test。
@@ -263,3 +308,24 @@ go build -o ocgate ./cmd/ocgate
 
 覆盖：配置加载、监听、两轮真实 HTTP 请求的 session 复用（new → resolved）、
 metrics 输出、SIGTERM 优雅退出。
+
+## 项目结构
+
+```
+cmd/ocgate/            入口：装配、信号处理、优雅关闭
+internal/
+  canon/               Canonical JSON + SHA-256 状态哈希
+  openai/              请求解析 + assistant 重建（delta / tool_calls）
+  sse/                 原始 SSE 事件扫描器
+  config/              YAML 配置（含样例配置防失效测试）
+  store/               SessionStore / TempPageStore 接口 + Redis 实现
+  collector/           流式采集：RAM 分页 → worker 池异步落 Redis
+  session/             SessionResolver（client > state hash > 新 UUID）
+  proxy/               ReverseProxy + SSE 旁路 + Finalize（含端到端测试）
+  metrics/             Prometheus opgate_* 指标
+scripts/smoke/         冒烟测试（独立 module）
+```
+
+## License
+
+[MIT](LICENSE) © ccbkkb
