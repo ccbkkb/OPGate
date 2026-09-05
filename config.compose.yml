@@ -1,0 +1,30 @@
+# OPGate configuration for docker-compose deployment
+# Redis 指向 compose 内的 redis 服务（用服务名，不是 127.0.0.1！）
+# 使用前先修改 upstream.base_url，然后:
+#   docker compose up -d
+
+server:
+  listen: ":8080"
+
+upstream:
+  base_url: "https://opencode.example.com/v1"
+
+redis:
+  addr: "redis:6379"
+  db: 0
+  timeout: 2s
+
+session:
+  ttl: 168h
+
+response_cache:
+  page_size: 4MiB
+  ttl: 30m
+  workers: 4
+  max_pending_pages: 8
+
+limits:
+  max_request_body: 32MiB
+
+logging:
+  level: info

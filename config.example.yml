@@ -1,4 +1,7 @@
 # OPGate example configuration (DEVELOP.md §55)
+# 注意：redis.addr 的 127.0.0.1 适用于宿主机 / Termux / systemd 运行；
+# 容器部署请改用 config.compose.yml（指向 compose 服务名 redis:6379），
+# 或把 addr 指向你的外部 Redis。
 
 server:
   listen: ":8080"

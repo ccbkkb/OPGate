@@ -1,5 +1,7 @@
 # OPGate + Redis 单机部署示例
-#   docker compose up -d
+#   1. 编辑 config.compose.yml，修改 upstream.base_url
+#      （redis.addr 已指向 compose 内的 redis 服务，不要改成 127.0.0.1）
+#   2. docker compose up -d
 services:
   ocgate:
     image: ghcr.io/ccbkkb/opgate:latest
@@ -8,7 +10,7 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - ./config.yml:/etc/ocgate/config.yml:ro
+      - ./config.compose.yml:/etc/ocgate/config.yml:ro
     depends_on:
       redis:
         condition: service_healthy

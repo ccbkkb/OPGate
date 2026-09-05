@@ -84,6 +84,20 @@ func TestDefaults(t *testing.T) {
 	}
 }
 
+// 样例配置必须始终能通过 Load+Validate，否则发布出去就是坏的。
+func TestExampleConfigsLoad(t *testing.T) {
+	for _, p := range []string{"../../config.example.yml", "../../config.compose.yml"} {
+		cfg, err := Load(p)
+		if err != nil {
+			t.Errorf("%s: %v", p, err)
+			continue
+		}
+		if cfg.Redis.Addr == "" {
+			t.Errorf("%s: redis.addr empty", p)
+		}
+	}
+}
+
 func TestValidate(t *testing.T) {
 	cfg := Default()
 	cfg.Upstream.BaseURL = "https://opencode.example.com/v1"

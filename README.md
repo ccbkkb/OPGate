@@ -175,15 +175,43 @@ docker run -d --name ocgate -p 8080:8080 \
   ghcr.io/ccbkkb/opgate:latest
 ```
 
-或使用 docker compose（含 Redis）：
+或使用 docker compose（自带 Redis）：
 
 ```bash
-cp config.example.yml config.yml   # 修改 upstream.base_url
+# 编辑 config.compose.yml，修改 upstream.base_url 后：
 docker compose up -d
 ```
 
 容器内配置路径为 `/etc/ocgate/config.yml`（只读挂载即可），监听端口默认 `:8080`，
 自带 `/healthz` HEALTHCHECK。
+
+### ⚠️ Redis 是必需组件
+
+会话映射（`oc:v1:session:*`）和长响应分页缓存（`oc:v1:tmp:*`）都存在 Redis 里，
+**部署时必须提供一个可达的 Redis**，注意区分两种模式：
+
+| 部署方式 | redis.addr 应填 |
+|---|---|
+| docker compose（自带 redis 服务） | `redis:6379`（服务名，见 `config.compose.yml`） |
+| 宿主机 / Termux / systemd 直接运行 | `127.0.0.1:6379`（`config.example.yml` 默认值） |
+| 独立 `docker run` + 外部/托管 Redis | 该 Redis 的 `host:port` |
+
+容器内写 `127.0.0.1` 指向的是**容器自己**，连不上 Redis 时网关不会退出、
+只输出一条 WARN 日志，但会静默降级：每轮对话都生成新 session、长响应不再落盘。
+生产环境务必确认启动日志里没有 `redis is not reachable`。
+
+独立 `docker run` 接外部 Redis 的示例：
+
+```bash
+docker network create ocgate
+docker run -d --name ocgate-redis --network ocgate redis:7-alpine
+docker run -d --name ocgate --network ocgate -p 8080:8080 \
+  -v $PWD/config.yml:/etc/ocgate/config.yml:ro \      # redis.addr 指向 ocgate-redis:6379
+  ghcr.io/ccbkkb/opgate:latest
+```
+
+> 按设计（DEVELOP.md §42），Redis 故障只影响会话复用，不影响代理与 SSE 可用性；
+> 多副本扩容时，多个网关实例可共享同一个 Redis。
 
 ### 二进制下载
 
