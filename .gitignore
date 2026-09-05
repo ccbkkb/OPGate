@@ -1,6 +1,7 @@
-# build artifacts
+# build artifacts (root-anchored! a bare "ocgate" pattern would also
+# ignore the cmd/ocgate/ source directory)
 /ocgate
-ocgate
+/ocgate.exe
 *.test
 
 # local config
