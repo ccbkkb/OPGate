@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -41,6 +42,7 @@ type testUpstream struct {
 	mu                 sync.Mutex
 	srv                *httptest.Server
 	scripts            [][]string // one SSE chunk script per request
+	auths              []string   // Authorization headers received
 	jsonResp           string
 	cut                bool
 	echo               bool
@@ -85,6 +87,12 @@ func (u *testUpstream) recorded() (sessions, bodies []string) {
 	return append([]string(nil), u.sessions...), append([]string(nil), u.bodies...)
 }
 
+func (u *testUpstream) authHeaders() []string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return append([]string(nil), u.auths...)
+}
+
 func (u *testUpstream) lastChunkTime() time.Time {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -98,6 +106,7 @@ func (u *testUpstream) handle(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	u.mu.Lock()
 	u.sessions = append(u.sessions, r.Header.Get("X-Opencode-Session"))
+	u.auths = append(u.auths, r.Header.Get("Authorization"))
 	u.bodies = append(u.bodies, string(body))
 	var script []string
 	if len(u.scripts) > 0 {
@@ -220,7 +229,8 @@ type gateway struct {
 	up *testUpstream
 }
 
-func newGateway(t *testing.T, mutate func(*config.Config)) *gateway {
+// newGateway 构建测试网关；可选传入自定义 logger（用于日志脱敏测试）。
+func newGateway(t *testing.T, mutate func(*config.Config), loggers ...*slog.Logger) *gateway {
 	t.Helper()
 	mr := miniredis.RunT(t)
 	up := newUpstream(t)
@@ -242,6 +252,9 @@ func newGateway(t *testing.T, mutate func(*config.Config)) *gateway {
 	t.Cleanup(func() { _ = rs.Close() })
 
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	if len(loggers) > 0 && loggers[0] != nil {
+		log = loggers[0]
+	}
 	pool := collector.NewPool(rs, collector.Config{
 		PageSize:        int(cfg.ResponseCache.PageSize),
 		TTL:             time.Duration(cfg.ResponseCache.TTL),
@@ -288,8 +301,14 @@ func doChat(h *Handler, body, session string) *httptest.ResponseRecorder {
 
 var testClientHash = canon.HashBytes([]byte("anonymous"))
 
-// stateKey builds the Redis key for a full conversation state.
+// stateKey builds the Redis key for a full conversation state using the
+// default anonymous client identity.
 func stateKey(msgs ...string) string {
+	return stateKeyFor("anonymous", msgs...)
+}
+
+// stateKeyFor builds the Redis key under the given raw client credential.
+func stateKeyFor(cred string, msgs ...string) string {
 	canonMsgs := make([][]byte, 0, len(msgs))
 	for _, m := range msgs {
 		c, err := canon.Canonicalize([]byte(m))
@@ -299,7 +318,7 @@ func stateKey(msgs ...string) string {
 		canonMsgs = append(canonMsgs, c)
 	}
 	full := canon.MessageArray(canonMsgs)
-	return store.SessionKey(testClientHash, canon.HashBytes(full))
+	return store.SessionKey(canon.HashBytes([]byte(cred)), canon.HashBytes(full))
 }
 
 func waitFor(t *testing.T, desc string, cond func() bool) {
@@ -754,4 +773,85 @@ func (u *testUpstream) sessionsOf(marker string) []string {
 		}
 	}
 	return out
+}
+
+// ------------------------------------------------------------------ logs
+
+// syncBuffer is a concurrency-safe buffer for capturing slog output
+// (finalize goroutines write concurrently with the test).
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// §43/§44: gateway logs must never contain the credential or any
+// request/response content; §54: raw credentials must never reach Redis.
+// The proxy must still forward the real credential upstream.
+func TestLogsAndRedisAreSanitized(t *testing.T) {
+	buf := &syncBuffer{}
+	logger := slog.New(slog.NewTextHandler(buf, nil))
+	g := newGateway(t, nil, logger)
+
+	const canaryKey = "sk-CANARY-SECRET-DO-NOT-LOG"
+	const canaryPrompt = "CANARY-PROMPT-CONTENT-XYZ"
+	const canaryReply = "CANARY-ASSISTANT-REPLY-XYZ"
+
+	g.up.push(canaryReply)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions",
+		strings.NewReader(chatBody(fmt.Sprintf(`{"role":"user","content":%s}`, mustJSONString(canaryPrompt)))))
+	req.Header.Set("Authorization", "Bearer "+canaryKey)
+	rec := httptest.NewRecorder()
+	g.h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d body %s", rec.Code, rec.Body.String())
+	}
+
+	// wait for finalize (mapping written) so all logging has happened;
+	// the mapping lives under the canary credential's own namespace (§9)
+	key := stateKeyFor("Bearer "+canaryKey,
+		fmt.Sprintf(`{"role":"user","content":%s}`, mustJSONString(canaryPrompt)),
+		fmt.Sprintf(`{"role":"assistant","content":%s}`, mustJSONString(canaryReply)))
+	waitFor(t, "mapping", func() bool { return g.mr.Exists(key) })
+
+	logs := buf.String()
+	for _, secret := range []string{canaryKey, canaryPrompt, canaryReply} {
+		if strings.Contains(logs, secret) {
+			t.Fatalf("logs leak %q:\n%s", secret, logs)
+		}
+	}
+
+	// correlation fields required by §43 must still be present
+	for _, want := range []string{"session_id=", "session_source=new", "state_hash=", "client_hash="} {
+		if !strings.Contains(logs, want) {
+			t.Fatalf("logs missing correlation field %q:\n%s", want, logs)
+		}
+	}
+
+	// redis keys/values: only hashes, never raw secrets
+	for _, k := range g.mr.Keys() {
+		if strings.Contains(k, canaryKey) || strings.Contains(k, canaryPrompt) {
+			t.Fatalf("redis key leaks a secret: %s", k)
+		}
+		if v, _ := g.mr.Get(k); strings.Contains(v, canaryKey) {
+			t.Fatalf("redis value leaks the credential: %s", k)
+		}
+	}
+
+	// the upstream must still receive the real credential (auth needs it)
+	auths := g.up.authHeaders()
+	if len(auths) != 1 || auths[0] != "Bearer "+canaryKey {
+		t.Fatalf("upstream Authorization headers: %v", auths)
+	}
 }
