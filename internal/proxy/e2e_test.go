@@ -898,10 +898,16 @@ func TestClientCloseAfterDoneStillMaps(t *testing.T) {
 	if !strings.Contains(string(seen), "[DONE]") {
 		t.Fatal("did not receive [DONE] before closing")
 	}
+
+	// the mapping must already exist the instant the client saw [DONE]:
+	// finalizeAtDone runs synchronously before the sentinel is flushed, so a
+	// follow-up request fired immediately afterwards cannot race it
+	key := stateKeyFor(cred, U1, A1E)
+	if !g.mr.Exists(key) {
+		t.Fatal("mapping not visible immediately after [DONE] (racing next request)")
+	}
 	_ = conn.Close()
 
-	// the mapping must still be created under this credential's namespace
-	key := stateKeyFor(cred, U1, A1E)
 	waitFor(t, "mapping after early client close", func() bool { return g.mr.Exists(key) })
 
 	// and the recorded decision must be completion, not abort

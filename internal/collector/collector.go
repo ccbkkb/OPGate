@@ -17,6 +17,7 @@
 package collector
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -153,16 +154,29 @@ type Collector struct {
 
 	inflight sync.WaitGroup // pages enqueued but not yet written
 	failed   atomic.Bool
+
+	// incremental "data: [DONE]" detection (see Write)
+	onDone  func()      // called once, from the copy goroutine
+	scanBuf []byte      // trailing incomplete line carried across writes
+	sawDone atomic.Bool
+	sealed  atomic.Bool // set once finalized early on [DONE]
 }
 
-// NewCollector creates a request-local collector.
-func (p *Pool) NewCollector(requestID string) *Collector {
-	return &Collector{
+// NewCollector creates a request-local collector. onDone, if set, is called
+// exactly once from the copy goroutine the moment a complete "data: [DONE]"
+// line has been written — the earliest point where finalize can run without
+// racing the client's next request.
+func (p *Pool) NewCollector(requestID string, onDone ...func()) *Collector {
+	c := &Collector{
 		pool:      p,
 		requestID: requestID,
 		pageSize:  p.cfg.PageSize,
 		tail:      make([]byte, 0, p.cfg.PageSize),
 	}
+	if len(onDone) > 0 {
+		c.onDone = onDone[0]
+	}
+	return c
 }
 
 // RequestID returns the collector's request ID.
@@ -172,15 +186,55 @@ func (c *Collector) RequestID() string { return c.requestID }
 // never returns an error; cache failures are recorded internally and
 // surface at Finalize.
 func (c *Collector) Write(p []byte) {
-	if c.failed.Load() {
-		return // resource protection: stop buffering, protect RAM
+	if c.sealed.Load() || c.failed.Load() {
+		return // finalized early, or resource protection
 	}
+	// data first: the [DONE]-time finalize must see this chunk
 	c.tail = append(c.tail, p...)
 	if len(c.tail) >= c.pageSize {
 		c.submit(c.tail)
 		c.tail = make([]byte, 0, c.pageSize)
 	}
+	c.watchDone(p)
+	if c.sealed.Load() {
+		// finalize already ran with the full payload; drop the tail
+		// (bytes after [DONE] carry no information we need)
+		c.tail = nil
+	}
 }
+
+// watchDone incrementally scans written bytes for a complete SSE data line
+// equal to "[DONE]". Only fully terminated lines count, so a message whose
+// content merely mentions "[DONE]" can never trigger it (the content travels
+// inside a JSON data line that differs as a whole).
+func (c *Collector) watchDone(p []byte) {
+	if c.onDone == nil || c.sawDone.Load() {
+		return
+	}
+	c.scanBuf = append(c.scanBuf, p...)
+	for {
+		i := bytes.IndexByte(c.scanBuf, '\n')
+		if i < 0 {
+			break
+		}
+		line := bytes.TrimSuffix(c.scanBuf[:i], []byte("\r"))
+		c.scanBuf = c.scanBuf[i+1:]
+		if bytes.Equal(bytes.TrimSpace(line), []byte("data: [DONE]")) {
+			c.sawDone.Store(true)
+			c.sealed.Store(true)
+			c.onDone()
+			return
+		}
+	}
+	// a single unterminated line longer than the cap cannot be the short
+	// [DONE] sentinel; drop it to keep the scan buffer bounded
+	if len(c.scanBuf) > 1<<20 {
+		c.scanBuf = c.scanBuf[:0]
+	}
+}
+
+// Done reports whether the [DONE] sentinel has been seen.
+func (c *Collector) Done() bool { return c.sawDone.Load() }
 
 // submit hands a full page to the queue. Called from the copy goroutine.
 func (c *Collector) submit(page []byte) {

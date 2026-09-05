@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -280,5 +281,43 @@ func TestAbortDeletesTempPages(t *testing.T) {
 	c.Abort(context.Background())
 	if got := st.pagecount("req-7"); got != 0 {
 		t.Fatalf("abort did not delete temp pages: %d remain", got)
+	}
+}
+
+// [DONE]-time detection: onDone fires the moment the sentinel line is fully
+// written, content mentioning "[DONE]" never triggers it, and post-[DONE]
+// writes are discarded (finalize already ran with the full payload).
+func TestDoneDetectionAndEarlySeal(t *testing.T) {
+	st := newFakeStore()
+	p := newTestPool(t, st, Config{PageSize: 100, TTL: time.Minute, OpTimeout: time.Second, MaxPendingPages: 8}, 2)
+
+	var fired int32
+	payload := ssePayload("hi", 3) // ends with a [DONE] event
+	c := p.NewCollector("req-done", func() {
+		atomic.AddInt32(&fired, 1)
+	})
+
+	writeInChunks(c, payload, 17)
+	if atomic.LoadInt32(&fired) != 1 {
+		t.Fatalf("onDone fired %d times, want 1", fired)
+	}
+	if !c.Done() {
+		t.Fatal("Done() must be true after the sentinel")
+	}
+	// post-[DONE] bytes are discarded
+	before := len(st.pages["req-done"])
+	c.Write([]byte("garbage after done\n\n"))
+	if got := len(st.pages["req-done"]); got != before {
+		t.Fatal("post-[DONE] writes must not flush pages")
+	}
+
+	// a data line whose JSON content merely mentions [DONE] must NOT trigger:
+	// the tricky stream ends with a genuine [DONE], so exactly one legal
+	// onDone (+1000) is expected and zero false positives
+	c2 := p.NewCollector("req-false", func() { atomic.AddInt32(&fired, 1000) })
+	tricky := "data: {\"choices\":[{\"delta\":{\"content\":\"see [DONE] marker\"}}]}\n\ndata: [DONE]\n\n"
+	writeInChunks(c2, []byte(tricky), 5)
+	if got := atomic.LoadInt32(&fired); got != 1001 {
+		t.Fatalf("false-positive detection: fired=%d, want exactly 1001 (one legal trigger)", got)
 	}
 }

@@ -62,8 +62,9 @@ type reqState struct {
 	jsonBuf   *bytes.Buffer        // non-streaming path
 	jsonTrunc bool
 
-	eof      atomic.Bool
-	finisher sync.Once
+	eof            atomic.Bool
+	earlyFinalized atomic.Bool // set when finalized at [DONE]-time
+	finisher       sync.Once
 }
 
 // Handler is the gateway root handler.
@@ -212,7 +213,9 @@ func (h *Handler) modifyResponse(resp *http.Response) error {
 	ct := resp.Header.Get("Content-Type")
 	switch {
 	case strings.HasPrefix(ct, "text/event-stream"):
-		st.collector = h.pool.NewCollector(st.requestID)
+		st.collector = h.pool.NewCollector(st.requestID, func() {
+			h.finalizeAtDone(st)
+		})
 		resp.Body = &streamBody{rc: resp.Body, st: st, h: h}
 	case strings.Contains(ct, "json"):
 		st.jsonBuf = &bytes.Buffer{}
@@ -295,6 +298,9 @@ func (b *jsonBody) Close() error {
 // the fully assembled payload (never guessed mid-stream, §23).
 func (h *Handler) finish(st *reqState) {
 	st.finisher.Do(func() {
+		if st.earlyFinalized.Load() {
+			return // already finalized the moment [DONE] was written
+		}
 		if st.eof.Load() {
 			h.m.StreamCompleted.Inc()
 			h.m.StreamDuration.Observe(time.Since(st.start).Seconds())
@@ -327,6 +333,9 @@ func (h *Handler) finish(st *reqState) {
 //   - [DONE] absent / cache failed → genuine abort: no mapping, cleanup.
 func (h *Handler) finalizeStreamOnClose(st *reqState) {
 	defer h.finalizeWG.Done()
+	if st.earlyFinalized.Load() {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), finalizeTimeout)
 	defer cancel()
 
@@ -358,8 +367,42 @@ func (h *Handler) finalizeStreamOnClose(st *reqState) {
 	h.putMapping(ctx, st, assistant)
 }
 
+// finalizeAtDone runs synchronously in the SSE copy goroutine the moment a
+// complete "data: [DONE]" line has been collected: the assistant payload is
+// complete, so the session mapping can be written before the client's very
+// next request arrives (real chat apps fire it within milliseconds). It does
+// not block Redis on the streaming path — [DONE] is the last meaningful
+// chunk, and the finalizeTimeout bounds the whole operation.
+func (h *Handler) finalizeAtDone(st *reqState) {
+	ctx, cancel := context.WithTimeout(context.Background(), finalizeTimeout)
+	defer cancel()
+
+	start := time.Now()
+	assistant, stats, err := st.collector.Finalize(ctx)
+	h.m.FinalizeDuration.Observe(time.Since(start).Seconds())
+	h.m.ResponseBytes.Observe(float64(stats.Bytes))
+	h.m.PageCount.Observe(float64(stats.Pages))
+	if err != nil {
+		// let the close-time path retry (tmp cleanup / TTL handles leftovers)
+		h.m.FinalizeError.Inc()
+		h.log.Warn("[DONE]-time finalize failed; retrying at close",
+			"request_id", st.requestID, "session_id", st.sessionID, "error", err)
+		return
+	}
+	st.earlyFinalized.Store(true)
+	h.m.StreamCompleted.Inc()
+	h.m.StreamDuration.Observe(time.Since(st.start).Seconds())
+	h.log.Info("stream finalized at [DONE]",
+		"request_id", st.requestID, "session_id", st.sessionID,
+		"pages", stats.Pages, "bytes", stats.Bytes)
+	h.putMapping(ctx, st, assistant)
+}
+
 func (h *Handler) finalizeStream(st *reqState) {
 	defer h.finalizeWG.Done()
+	if st.earlyFinalized.Load() {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), finalizeTimeout)
 	defer cancel()
 
