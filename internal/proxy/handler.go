@@ -283,9 +283,16 @@ func (b *jsonBody) Close() error {
 	return err
 }
 
-// finish runs exactly once per request: on EOF (normal completion) it
-// schedules finalize; on early body close (client disconnect, upstream
-// failure) it schedules abort. Neither blocks the response path.
+// finish runs exactly once per request: on EOF it schedules finalize; on
+// early body close it schedules a close-time finalize that inspects the
+// collected data before deciding completion vs abort.
+//
+// Why the close path is not a plain abort: real SSE clients (RikkaHub, httpx,
+// ...) close the connection immediately after reading "data: [DONE]" — the
+// proxy then sees a client disconnect with no transport-level EOF. Whether
+// the stream actually completed can only be decided from the data itself,
+// which finalizeStreamOnClose does by checking for the [DONE] sentinel in
+// the fully assembled payload (never guessed mid-stream, §23).
 func (h *Handler) finish(st *reqState) {
 	st.finisher.Do(func() {
 		if st.eof.Load() {
@@ -301,14 +308,54 @@ func (h *Handler) finish(st *reqState) {
 			}
 			return
 		}
-		h.m.StreamAborted.Inc()
-		h.log.Warn("stream aborted before completion; no session mapping",
-			"request_id", st.requestID, "session_id", st.sessionID)
 		if st.collector != nil {
 			h.finalizeWG.Add(1)
-			go h.abortCollector(st)
+			go h.finalizeStreamOnClose(st)
+			return
 		}
+		h.m.StreamAborted.Inc()
+		h.log.Warn("stream closed before completion; no session mapping",
+			"request_id", st.requestID, "session_id", st.sessionID)
 	})
+}
+
+// finalizeStreamOnClose handles streams that ended without a transport-level
+// EOF (typically: the client closed right after [DONE], or the upstream
+// closed cleanly without EOF framing). Finalize assembles the full payload
+// from Redis pages + RAM tail and checks the [DONE] sentinel there:
+//   - [DONE] present → the stream is protocol-complete: map the session;
+//   - [DONE] absent / cache failed → genuine abort: no mapping, cleanup.
+func (h *Handler) finalizeStreamOnClose(st *reqState) {
+	defer h.finalizeWG.Done()
+	ctx, cancel := context.WithTimeout(context.Background(), finalizeTimeout)
+	defer cancel()
+
+	start := time.Now()
+	assistant, stats, err := st.collector.Finalize(ctx)
+	h.m.FinalizeDuration.Observe(time.Since(start).Seconds())
+	h.m.ResponseBytes.Observe(float64(stats.Bytes))
+	h.m.PageCount.Observe(float64(stats.Pages))
+
+	if err != nil {
+		h.m.StreamAborted.Inc()
+		h.m.FinalizeError.Inc()
+		h.log.Warn("stream closed without completion; no session mapping",
+			"request_id", st.requestID,
+			"session_id", st.sessionID,
+			"state_hash", canon.Short(st.historyHash),
+			"pages", stats.Pages,
+			"bytes", stats.Bytes,
+			"error", err,
+		)
+		return
+	}
+
+	// [DONE] was in the payload: protocol-complete despite the early close.
+	h.m.StreamCompleted.Inc()
+	h.m.StreamDuration.Observe(time.Since(st.start).Seconds())
+	h.log.Info("stream completed at connection close ([DONE] in payload)",
+		"request_id", st.requestID, "session_id", st.sessionID)
+	h.putMapping(ctx, st, assistant)
 }
 
 func (h *Handler) finalizeStream(st *reqState) {

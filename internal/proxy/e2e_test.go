@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -853,5 +854,59 @@ func TestLogsAndRedisAreSanitized(t *testing.T) {
 	auths := g.up.authHeaders()
 	if len(auths) != 1 || auths[0] != "Bearer "+canaryKey {
 		t.Fatalf("upstream Authorization headers: %v", auths)
+	}
+}
+
+// Real chat apps close the connection right after reading "data: [DONE]".
+// The gateway must treat such a stream as complete and still write the
+// session mapping (the [DONE] sentinel is verified in the assembled
+// payload — never guessed).
+func TestClientCloseAfterDoneStillMaps(t *testing.T) {
+	g := newGateway(t, nil)
+	g.up.push("He", "llo")
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{Handler: g.h}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	const cred = "Bearer test-credential"
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := chatBody(U1)
+	fmt.Fprintf(conn, "POST /v1/chat/completions HTTP/1.1\r\n"+
+		"Host: opgate\r\n"+
+		"Authorization: %s\r\n"+
+		"Content-Type: application/json\r\n"+
+		"Content-Length: %d\r\n\r\n%s", cred, len(body), body)
+
+	// read until [DONE], then close early — no EOF, no further reading
+	seen := make([]byte, 0, 4096)
+	chunk := make([]byte, 1024)
+	for !strings.Contains(string(seen), "[DONE]") {
+		n, err := conn.Read(chunk)
+		seen = append(seen, chunk[:n]...)
+		if err != nil {
+			break
+		}
+	}
+	if !strings.Contains(string(seen), "[DONE]") {
+		t.Fatal("did not receive [DONE] before closing")
+	}
+	_ = conn.Close()
+
+	// the mapping must still be created under this credential's namespace
+	key := stateKeyFor(cred, U1, A1E)
+	waitFor(t, "mapping after early client close", func() bool { return g.mr.Exists(key) })
+
+	// and the recorded decision must be completion, not abort
+	sessions, _ := g.up.recorded()
+	if len(sessions) != 1 || !uuidRe.MatchString(sessions[0]) {
+		t.Fatalf("upstream sessions: %v", sessions)
 	}
 }
