@@ -1,0 +1,13 @@
+# build artifacts
+/ocgate
+ocgate
+*.test
+
+# local config
+config.yml
+
+# logs
+*.log
+
+# smoke build artifact
+scripts/smoke/ocgate-smoke

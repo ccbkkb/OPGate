@@ -1,0 +1,224 @@
+name: Release
+
+# 发布流程：推送 v* 标签即触发 —— 自动交叉编译全平台二进制、
+# 构建并推送多架构 Docker 镜像到 ghcr.io，并创建带完整说明的 GitHub Release。
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build-binaries:
+    name: Build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux（静态链接，Debian/Ubuntu/Fedora/Arch 等通用）
+          - { goos: linux,   goarch: amd64,  name: linux-amd64,  archive: tar.gz }
+          - { goos: linux,   goarch: arm64,  name: linux-arm64,  archive: tar.gz }
+          - { goos: linux,   goarch: arm,    goarm: "7", name: linux-armv7, archive: tar.gz }
+          - { goos: linux,   goarch: "386",  name: linux-386,    archive: tar.gz }
+          # macOS（Intel / Apple Silicon）
+          - { goos: darwin,  goarch: amd64,  name: macos-amd64,  archive: tar.gz }
+          - { goos: darwin,  goarch: arm64,  name: macos-arm64,  archive: tar.gz }
+          # Windows
+          - { goos: windows, goarch: amd64,  name: windows-amd64, archive: zip }
+          - { goos: windows, goarch: arm64,  name: windows-arm64, archive: zip }
+          # Android（Termux）
+          - { goos: android, goarch: arm64,  name: android-arm64, archive: tar.gz }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          CGO_ENABLED=0 go build -trimpath \
+            -ldflags "-s -w -X main.version=${VERSION}" \
+            -o "dist/ocgate${{ matrix.goos == 'windows' && '.exe' || '' }}" \
+            ./cmd/ocgate
+          cp config.example.yml README.md dist/
+          cd dist
+          BASE="ocgate_${VERSION}_${{ matrix.name }}"
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            zip -q "${BASE}.zip" *
+          else
+            tar -czf "${BASE}.tar.gz" *
+          fi
+          rm -f ocgate ocgate.exe config.example.yml README.md
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+          if-no-files-found: error
+
+  docker:
+    name: Docker image (multi-arch)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute lowercase image name
+        id: image
+        run: echo "name=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+        env:
+          REGISTRY: ${{ env.REGISTRY }}
+
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: amd64,arm64,arm
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+          labels: |
+            org.opencontainers.image.title=OPGate
+            org.opencontainers.image.description=OpenCode Session Gateway — reverse proxy with x-opencode-session affinity
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: ${{ startsWith(github.ref, 'refs/tags/v') }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    name: Create release
+    runs-on: ubuntu-latest
+    needs: [build-binaries, docker]
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum ocgate_* | tee SHA256SUMS.txt
+
+      - name: Generate release notes body
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          PREV="$(git tag --sort=-creatordate | grep -vx "$TAG" | head -1 || true)"
+          {
+            echo "## OPGate ${TAG}"
+            echo
+            echo "OpenCode Session Gateway —— 为不支持 \`x-opencode-session\` 的"
+            echo "OpenAI-compatible 客户端提供会话亲和的轻量反向代理。"
+            echo
+            echo "### 📦 下载"
+            echo
+            echo "| 平台 | 文件 |"
+            echo "|---|---|"
+            echo "| Linux x86_64（Debian/Ubuntu/Fedora/Arch 通用） | \`ocgate_${TAG}_linux-amd64.tar.gz\` |"
+            echo "| Linux arm64 / armv7 / 386 | \`ocgate_${TAG}_linux-arm64.tar.gz\` 等 |"
+            echo "| Alpine（静态二进制，同 Linux 包） | \`ocgate_${TAG}_linux-*.tar.gz\` |"
+            echo "| macOS Intel / Apple Silicon | \`ocgate_${TAG}_macos-*.tar.gz\` |"
+            echo "| Windows amd64 / arm64 | \`ocgate_${TAG}_windows-*.zip\` |"
+            echo "| Android（Termux） | \`ocgate_${TAG}_android-arm64.tar.gz\` |"
+            echo "| Docker 多架构镜像 | \`ghcr.io/ccbkkb/opgate:${TAG}\` |"
+            echo
+            echo "### 🐳 Docker"
+            echo
+            echo '```bash'
+            echo "docker pull ghcr.io/ccbkkb/opgate:${TAG}"
+            echo "docker run -d --name ocgate -p 8080:8080 \\"
+            echo "  -v \$PWD/config.yml:/etc/ocgate/config.yml:ro \\"
+            echo "  ghcr.io/ccbkkb/opgate:${TAG}"
+            echo '```'
+            echo
+            echo "支持架构：\`linux/amd64\`、\`linux/arm64\`、\`linux/arm/v7\`。"
+            echo
+            echo "### ✅ 校验"
+            echo
+            echo '```bash'
+            echo "sha256sum -c SHA256SUMS.txt --ignore-missing"
+            echo '```'
+            echo
+            echo "### 🚀 快速开始"
+            echo
+            echo '```bash'
+            echo "tar -xzf ocgate_${TAG}_linux-amd64.tar.gz"
+            echo "cp config.example.yml config.yml   # 修改 upstream.base_url"
+            echo "./ocgate -config config.yml"
+            echo '```'
+            echo
+            echo "### 📝 变更"
+            echo
+            if [ -n "$PREV" ]; then
+              echo "**自 ${PREV} 以来的提交：**"
+              echo
+              git log --no-decorate --format='- %h %s' "${PREV}..${TAG}"
+            else
+              echo "首个发布版本，完整功能请参见 README。"
+              echo
+              echo "- 会话亲和：Conversation State Hash → OpenCode Session ID"
+              echo "- SSE 实时旁路：Redis 不在实时路径上"
+              echo "- 长响应分页落盘（Redis），RAM 占用有界"
+              echo "- 会话分支、失败不污染映射、优雅关闭"
+            fi
+          } > release_notes.md
+          cat release_notes.md
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "OPGate ${GITHUB_REF_NAME}" \
+            --notes-file release_notes.md \
+            --verify-tag \
+            dist/*

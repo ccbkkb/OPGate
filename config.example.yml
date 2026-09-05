@@ -1,0 +1,29 @@
+# OPGate example configuration (DEVELOP.md §55)
+
+server:
+  listen: ":8080"
+
+upstream:
+  # Base URL of the OpenCode API. A path prefix (e.g. "/v1") is preserved.
+  base_url: "https://opencode.example.com/v1"
+
+redis:
+  addr: "127.0.0.1:6379"
+  db: 0
+  timeout: 2s
+
+session:
+  # Conversation state hash -> session ID mapping TTL. Default: 168h (7d).
+  ttl: 168h
+
+response_cache:
+  page_size: 4MiB
+  ttl: 30m
+  workers: 4
+  max_pending_pages: 8
+
+limits:
+  max_request_body: 32MiB
+
+logging:
+  level: info
